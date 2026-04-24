@@ -7,6 +7,22 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+CONTENT_TYPE_MAP = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".glb": "model/gltf-binary",
+    ".obj": "text/plain",
+}
+
+
+def get_content_type(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    return CONTENT_TYPE_MAP.get(ext, "application/octet-stream")
+
+
 class CloudStorage:
     def __init__(self):
         self.enabled = os.getenv("SGLANG_CLOUD_STORAGE_TYPE", "").lower() == "s3"
@@ -49,18 +65,7 @@ class CloudStorage:
 
         def _sync_upload():
             """Synchronous part of the upload to run in a thread."""
-            ext = os.path.splitext(local_path)[1].lower()
-            content_type = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".mp4": "video/mp4",
-                ".glb": "model/gltf-binary",
-                ".obj": "text/plain",
-            }.get(ext, "application/octet-stream")
-
-            # Use the client created once in __init__
+            content_type = get_content_type(local_path)
             self.client.upload_file(
                 local_path,
                 self.bucket_name,
@@ -88,8 +93,15 @@ class CloudStorage:
         logger.info(f"Uploaded {local_path} to {url}")
         return url
 
-    async def upload_and_cleanup(self, file_path: str) -> Optional[str]:
-        """Helper to upload a file and delete the local copy if successful."""
+    async def upload_and_cleanup(
+        self, file_path: str, presigned_url: Optional[str] = None
+    ) -> Optional[str]:
+        if presigned_url:
+            success = await self.upload_to_presigned_url(
+                presigned_url, file_path, cleanup=True
+            )
+            return presigned_url if success else None
+
         if not self.is_enabled():
             return None
 
@@ -98,11 +110,60 @@ class CloudStorage:
 
         if url:
             try:
-                # pass if removal fails
                 os.remove(file_path)
             except OSError as e:
                 logger.warning(f"Failed to remove temporary file {file_path}: {e}")
         return url
+
+    async def upload_to_presigned_url(
+        self,
+        presigned_url: str,
+        file_path: str,
+        cleanup: bool = False,
+    ) -> bool:
+        try:
+            import httpx
+        except ImportError:
+            logger.error(
+                "httpx is not installed. Please install it with `pip install httpx` "
+                "to use presigned URL upload."
+            )
+            return False
+
+        content_type = get_content_type(file_path)
+
+        try:
+            with open(file_path, "rb") as f:
+                file_content = f.read()
+        except IOError as e:
+            logger.error(f"Failed to read file {file_path}: {e}")
+            return False
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.put(
+                    presigned_url,
+                    content=file_content,
+                    headers={"Content-Type": content_type},
+                )
+                if 200 <= response.status_code < 300:
+                    logger.info(f"Uploaded {file_path} to presigned URL")
+                    if cleanup:
+                        try:
+                            os.remove(file_path)
+                        except OSError as e:
+                            logger.warning(
+                                f"Failed to remove temporary file {file_path}: {e}"
+                            )
+                    return True
+                else:
+                    logger.error(
+                        f"Upload to presigned URL failed: {response.status_code}"
+                    )
+                    return False
+        except Exception as e:
+            logger.error(f"Upload to presigned URL failed: {e}")
+            return False
 
 
 # Global instance
